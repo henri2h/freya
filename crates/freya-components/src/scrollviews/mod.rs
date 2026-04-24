@@ -1,3 +1,4 @@
+mod scroll_physics;
 mod scrollbar;
 mod scrollthumb;
 mod scrollview;
@@ -5,6 +6,7 @@ mod shared;
 mod use_scroll_controller;
 mod virtual_scrollview;
 
+pub use scroll_physics::*;
 pub use scrollbar::*;
 pub use scrollthumb::*;
 pub use scrollview::*;

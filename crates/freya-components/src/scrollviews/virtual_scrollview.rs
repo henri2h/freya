@@ -17,6 +17,11 @@ use crate::scrollviews::{
     ScrollConfig,
     ScrollController,
     ScrollThumb,
+    scroll_physics::{
+        VelocityTracker,
+        MIN_FLING_VELOCITY,
+        momentum_scroll,
+    },
     shared::{
         Axis,
         get_container_sizes,
@@ -312,6 +317,8 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
             .unwrap_or_else(|| use_scroll_controller(ScrollConfig::default));
         let mut dragging_content = use_state::<Option<CursorPoint>>(|| None);
         let mut drag_origin = use_state::<Option<CursorPoint>>(|| None);
+        let mut velocity_tracker = use_state(VelocityTracker::default);
+        let mut momentum_task = use_state::<Option<TaskHandle>>(|| None);
         let (scrolled_x, scrolled_y) = scroll_controller.into();
         let layout = &self.layout.layout;
         let direction = layout.direction;
@@ -363,9 +370,35 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                 clicking_scrollbar.set(None);
             }
 
-            if drag_scrolling && (dragging_content().is_some() || drag_origin().is_some()) {
-                dragging_content.set(None);
-                drag_origin.set(None);
+            if drag_scrolling {
+                let was_dragging = dragging_content().is_some();
+                if dragging_content().is_some() || drag_origin().is_some() {
+                    dragging_content.set(None);
+                    drag_origin.set(None);
+                }
+                if was_dragging {
+                    let (vx, vy) = velocity_tracker.read().velocity();
+                    velocity_tracker.write().clear();
+                    if vx.abs() > MIN_FLING_VELOCITY || vy.abs() > MIN_FLING_VELOCITY {
+                        if let Some(task) = *momentum_task.peek() {
+                            task.cancel();
+                        }
+                        let viewport_w = size.read().area.width();
+                        let viewport_h = size.read().area.height();
+                        let task = spawn(momentum_scroll(
+                            scroll_controller,
+                            vx,
+                            vy,
+                            inner_width,
+                            inner_height,
+                            viewport_w,
+                            viewport_h,
+                        ));
+                        momentum_task.set(Some(task));
+                    }
+                } else {
+                    velocity_tracker.write().clear();
+                }
             }
         };
 
@@ -403,6 +436,11 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                 e.stop_propagation();
             });
             timeout.reset();
+            let task_opt = *momentum_task.peek();
+            if let Some(task) = task_opt {
+                task.cancel();
+                momentum_task.set(None);
+            }
         };
 
         let on_mouse_move = move |_| {
@@ -419,6 +457,7 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                     scroll_controller.scroll_to_x((corrected_scrolled_x - delta.x as f32) as i32);
 
                     dragging_content.set(Some(coords));
+                    velocity_tracker.write().push(coords);
                     e.prevent_default();
                     timeout.reset();
                     a11y_id.request_focus();
@@ -440,6 +479,7 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                             .scroll_to_x((corrected_scrolled_x - delta.x as f32) as i32);
 
                         dragging_content.set(Some(coords));
+                        velocity_tracker.write().push(coords);
                         e.prevent_default();
                         timeout.reset();
                         a11y_id.request_focus();
@@ -562,6 +602,12 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
 
         let on_pointer_down = move |e: Event<PointerEventData>| {
             if drag_scrolling && matches!(e.data(), PointerEventData::Touch(_)) {
+                let task_opt = *momentum_task.peek();
+                if let Some(task) = task_opt {
+                    task.cancel();
+                    momentum_task.set(None);
+                }
+                velocity_tracker.write().clear();
                 drag_origin.set(Some(e.global_location()));
             }
         };
