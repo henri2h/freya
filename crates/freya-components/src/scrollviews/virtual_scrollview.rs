@@ -319,6 +319,7 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
         let mut drag_origin = use_state::<Option<CursorPoint>>(|| None);
         let mut velocity_tracker = use_state(VelocityTracker::default);
         let mut momentum_task = use_state::<Option<TaskHandle>>(|| None);
+        let mut suppress_next_press = use_state(|| false);
         let (scrolled_x, scrolled_y) = scroll_controller.into();
         let layout = &self.layout.layout;
         let direction = layout.direction;
@@ -372,10 +373,18 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
 
             if drag_scrolling {
                 let was_dragging = dragging_content().is_some();
+                let was_suppressed = *suppress_next_press.peek();
+                suppress_next_press.set(false);
+
                 if dragging_content().is_some() || drag_origin().is_some() {
                     dragging_content.set(None);
                     drag_origin.set(None);
                 }
+
+                if was_dragging || was_suppressed {
+                    e.prevent_default();
+                }
+
                 if was_dragging {
                     let (vx, vy) = velocity_tracker.read().velocity();
                     velocity_tracker.write().clear();
@@ -606,6 +615,7 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                 if let Some(task) = task_opt {
                     task.cancel();
                     momentum_task.set(None);
+                    suppress_next_press.set(true);
                 }
                 velocity_tracker.write().clear();
                 drag_origin.set(Some(e.global_location()));
