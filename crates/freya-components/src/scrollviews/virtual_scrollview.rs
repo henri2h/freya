@@ -388,21 +388,26 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                 if was_dragging {
                     let (vx, vy) = velocity_tracker.read().velocity();
                     velocity_tracker.write().clear();
+                    if let Some(task) = *momentum_task.peek() {
+                        task.cancel();
+                        momentum_task.set(None);
+                    }
                     if vx.abs() > MIN_FLING_VELOCITY || vy.abs() > MIN_FLING_VELOCITY {
-                        if let Some(task) = *momentum_task.peek() {
-                            task.cancel();
-                        }
                         let viewport_w = size.read().area.width();
                         let viewport_h = size.read().area.height();
-                        let task = spawn(momentum_scroll(
-                            scroll_controller,
-                            vx,
-                            vy,
-                            inner_width,
-                            inner_height,
-                            viewport_w,
-                            viewport_h,
-                        ));
+                        let task = spawn(async move {
+                            momentum_scroll(
+                                scroll_controller,
+                                vx,
+                                vy,
+                                inner_width,
+                                inner_height,
+                                viewport_w,
+                                viewport_h,
+                            )
+                            .await;
+                            momentum_task.set(None);
+                        });
                         momentum_task.set(Some(task));
                     }
                 } else {

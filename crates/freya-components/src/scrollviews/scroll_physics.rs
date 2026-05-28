@@ -61,7 +61,7 @@ impl VelocityTracker {
         let start = len.saturating_sub(VELOCITY_SAMPLES);
         let (p0, t0) = &self.samples[start];
         let (p1, t1) = &self.samples[len - 1];
-        let dt = t1.duration_since(*t0).as_secs_f32();
+        let dt = t1.checked_duration_since(*t0).map(|d| d.as_secs_f32()).unwrap_or(0.0);
         if dt < 0.001 {
             return (0.0, 0.0);
         }
@@ -71,12 +71,12 @@ impl VelocityTracker {
     }
 }
 
-/// Pre-compute total fling distance (px) from a given speed (px/s).
+/// Pre-compute total fling distance (px) from a speed (px/s) and pre-computed duration (s).
 ///
 /// Derived from `v(t) = speed * (1 - t/T)^(DECELERATION_RATE - 1)`, consistent
 /// with Flutter's `ClampingScrollSimulation`: `D = speed * T / DECELERATION_RATE`.
-fn fling_distance(speed: f32) -> f32 {
-    speed * fling_duration_secs(speed) / DECELERATION_RATE
+fn fling_distance(speed: f32, duration: f32) -> f32 {
+    speed * duration / DECELERATION_RATE
 }
 
 /// Pre-compute total fling duration (seconds) from a given speed (px/s).
@@ -116,8 +116,8 @@ pub async fn momentum_scroll(
         return;
     }
 
-    let total_distance = fling_distance(speed);
     let total_duration = fling_duration_secs(speed);
+    let total_distance = fling_distance(speed, total_duration);
     if total_duration <= 0.0 || total_distance <= 0.0 {
         return;
     }
