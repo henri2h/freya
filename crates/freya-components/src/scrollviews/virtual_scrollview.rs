@@ -1,39 +1,40 @@
-use std::{
-    ops::Range,
-    time::Duration,
-};
+use std::{ops::Range, time::Duration};
 
 use freya_core::prelude::*;
 use freya_sdk::timeout::use_timeout;
-use torin::{
-    geometry::CursorPoint,
-    node::Node,
-    prelude::Direction,
-    size::Size,
-};
+use torin::{geometry::CursorPoint, node::Node, prelude::Direction, size::Size};
 
 use crate::scrollviews::{
-    ScrollBar,
-    ScrollConfig,
-    ScrollController,
-    ScrollThumb,
-    scroll_physics::{
-        VelocityTracker,
-        MIN_FLING_VELOCITY,
-        momentum_scroll,
-    },
+    ScrollBar, ScrollConfig, ScrollController, ScrollThumb,
+    scroll_physics::{MIN_FLING_VELOCITY, VelocityTracker, momentum_scroll},
     shared::{
-        Axis,
-        get_container_sizes,
-        get_corrected_scroll_position,
-        get_scroll_position_from_cursor,
-        get_scroll_position_from_wheel,
-        get_scrollbar_pos_and_size,
-        handle_key_event,
+        Axis, get_container_sizes, get_corrected_scroll_position, get_scroll_position_from_cursor,
+        get_scroll_position_from_wheel, get_scrollbar_pos_and_size, handle_key_event,
         is_scrollbar_visible,
     },
     use_scroll_controller,
 };
+
+/// Controls how [`VirtualScrollView`] determines the size (height for vertical scrolling, width
+/// for horizontal) of each item.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ItemSize {
+    /// Every item has exactly this size.
+    Fixed(f32),
+    /// Items may have different sizes. Not-yet-measured items render at `estimate`; once an
+    /// item is laid out its real size is cached and the scroll position is corrected so
+    /// already-scrolled-past content doesn't jump.
+    Dynamic {
+        /// Initial size used for items that haven't been measured yet.
+        estimate: f32,
+    },
+}
+
+impl From<f32> for ItemSize {
+    fn from(value: f32) -> Self {
+        ItemSize::Fixed(value)
+    }
+}
 
 /// One-direction scrollable area that dynamically builds and renders items based in their size and current available size,
 /// this is intended for apps using large sets of data that need good performance.
@@ -76,14 +77,42 @@ use crate::scrollviews::{
 ///
 /// # Preview
 /// ![VirtualScrollView Preview][virtual_scrollview]
+///
+/// # Dynamic item sizes
+///
+/// When items don't all share the same size (e.g. a chat timeline with wrapping text), use
+/// [`ItemSize::Dynamic`] instead of a fixed size. Unmeasured items render at `estimate`; once an
+/// item is laid out its real size is cached and the scroll position is corrected so
+/// already-scrolled-past content doesn't jump.
+///
+/// ```rust
+/// # use freya::prelude::*;
+/// fn app() -> impl IntoElement {
+///     VirtualScrollView::new(|i, _| {
+///         rect()
+///             .key(i)
+///             .padding(4.)
+///             .child(format!("Item {i}, this text might wrap onto multiple lines"))
+///             .into()
+///     })
+///     .length(300usize)
+///     .item_size(ItemSize::Dynamic { estimate: 25. })
+/// }
+/// ```
 #[cfg_attr(feature = "docs",
     doc = embed_doc_image::embed_image!("virtual_scrollview", "images/gallery_virtual_scrollview.png")
 )]
+/// Context provided to all descendants of a [`VirtualScrollView`] indicating whether a drag or
+/// momentum scroll is currently active. Consume with `try_consume_context::<IsScrollingCtx>()`
+/// and read `.0` reactively (`.0.read()`) so the consumer re-renders when the flag changes.
+#[derive(Clone, Copy)]
+pub struct IsScrollingCtx(pub State<bool>);
+
 #[derive(Clone)]
 pub struct VirtualScrollView<D, B: Fn(usize, &D) -> Element> {
     builder: B,
     builder_data: D,
-    item_size: f32,
+    item_size: ItemSize,
     length: usize,
     layout: LayoutData,
     show_scrollbar: bool,
@@ -127,7 +156,7 @@ impl<B: Fn(usize, &()) -> Element> VirtualScrollView<(), B> {
         Self {
             builder,
             builder_data: (),
-            item_size: 0.,
+            item_size: ItemSize::Fixed(0.),
             length: 0,
             layout: {
                 let mut l = LayoutData::default();
@@ -149,7 +178,7 @@ impl<B: Fn(usize, &()) -> Element> VirtualScrollView<(), B> {
         Self {
             builder,
             builder_data: (),
-            item_size: 0.,
+            item_size: ItemSize::Fixed(0.),
             length: 0,
             layout: {
                 let mut l = LayoutData::default();
@@ -195,7 +224,7 @@ impl<D, B: Fn(usize, &D) -> Element> VirtualScrollView<D, B> {
         Self {
             builder,
             builder_data,
-            item_size: 0.,
+            item_size: ItemSize::Fixed(0.),
             length: 0,
             layout: Node {
                 width: Size::fill(),
@@ -221,7 +250,7 @@ impl<D, B: Fn(usize, &D) -> Element> VirtualScrollView<D, B> {
         Self {
             builder,
             builder_data,
-            item_size: 0.,
+            item_size: ItemSize::Fixed(0.),
             length: 0,
 
             layout: Node {
@@ -320,20 +349,40 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
         let mut velocity_tracker = use_state(VelocityTracker::default);
         let mut momentum_task = use_state::<Option<TaskHandle>>(|| None);
         let mut suppress_next_press = use_state(|| false);
+        let mut item_sizes = use_state(Vec::<f32>::new);
+        let mut item_sizes_total = use_state(|| 0f32);
+        let mut is_scrolling_state = use_state(|| false);
+        use_provide_context(|| IsScrollingCtx(is_scrolling_state));
         let (scrolled_x, scrolled_y) = scroll_controller.into();
         let layout = &self.layout.layout;
         let direction = layout.direction;
         let drag_scrolling = self.drag_scrolling;
 
+        // Keep the size cache in sync with `self.length` for `Dynamic` items, growing/shrinking
+        // it (and the running total) as needed. New entries start at `estimate` until measured.
+        if let ItemSize::Dynamic { estimate } = self.item_size {
+            let current_len = item_sizes.peek().len();
+            let target_len = self.length;
+            if current_len != target_len {
+                item_sizes.with_mut(|mut sizes| {
+                    if target_len > current_len {
+                        *item_sizes_total.write() += estimate * (target_len - current_len) as f32;
+                        sizes.resize(target_len, estimate);
+                    } else {
+                        *item_sizes_total.write() -= sizes[target_len..].iter().sum::<f32>();
+                        sizes.truncate(target_len);
+                    }
+                });
+            }
+        }
+
+        let scrolled_axis_inner_size = match self.item_size {
+            ItemSize::Fixed(item_size) => item_size * self.length as f32,
+            ItemSize::Dynamic { .. } => *item_sizes_total.read(),
+        };
         let (inner_width, inner_height) = match direction {
-            Direction::Vertical => (
-                size.read().inner_sizes.width,
-                self.item_size * self.length as f32,
-            ),
-            Direction::Horizontal => (
-                self.item_size * self.length as f32,
-                size.read().inner_sizes.height,
-            ),
+            Direction::Vertical => (size.read().inner_sizes.width, scrolled_axis_inner_size),
+            Direction::Horizontal => (scrolled_axis_inner_size, size.read().inner_sizes.height),
         };
 
         scroll_controller.use_apply(inner_width, inner_height);
@@ -388,7 +437,8 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                 if was_dragging {
                     let (vx, vy) = velocity_tracker.read().velocity();
                     velocity_tracker.write().clear();
-                    if let Some(task) = *momentum_task.peek() {
+                    let task_opt = *momentum_task.peek(); // extract before if-let to drop ReadRef
+                    if let Some(task) = task_opt {
                         task.cancel();
                         momentum_task.set(None);
                     }
@@ -407,8 +457,11 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                             )
                             .await;
                             momentum_task.set(None);
+                            is_scrolling_state.set(false);
                         });
                         momentum_task.set(Some(task));
+                    } else {
+                        is_scrolling_state.set(false);
                     }
                 } else {
                     velocity_tracker.write().clear();
@@ -454,6 +507,7 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
             if let Some(task) = task_opt {
                 task.cancel();
                 momentum_task.set(None);
+                is_scrolling_state.set(false);
             }
         };
 
@@ -493,6 +547,7 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
                             .scroll_to_x((corrected_scrolled_x - delta.x as f32) as i32);
 
                         dragging_content.set(Some(coords));
+                        is_scrolling_state.set(true);
                         velocity_tracker.write().push(coords);
                         e.prevent_default();
                         timeout.reset();
@@ -586,41 +641,124 @@ impl<D: PartialEq + 'static, B: Fn(usize, &D) -> Element + 'static> Component
             (size.read().area.width(), corrected_scrolled_x)
         };
 
-        let render_range = get_render_range(
-            viewport_size,
-            scroll_position,
-            self.item_size,
-            self.length as f32,
-        );
-
-        let children = render_range
-            .map(|i| (self.builder)(i, &self.builder_data))
-            .collect::<Vec<Element>>();
-
-        let (offset_x, offset_y) = match direction {
-            Direction::Vertical => {
-                let offset_y_min =
-                    (-corrected_scrolled_y / self.item_size).floor() * self.item_size;
-                let offset_y = -(-corrected_scrolled_y - offset_y_min);
-
-                (corrected_scrolled_x, offset_y)
+        let (render_range, start_offset) = match self.item_size {
+            ItemSize::Fixed(item_size) => {
+                let range = get_render_range(
+                    viewport_size,
+                    scroll_position,
+                    item_size,
+                    self.length as f32,
+                );
+                let start_offset = (-scroll_position / item_size).floor() * item_size;
+                (range, start_offset)
             }
-            Direction::Horizontal => {
-                let offset_x_min =
-                    (-corrected_scrolled_x / self.item_size).floor() * self.item_size;
-                let offset_x = -(-corrected_scrolled_x - offset_x_min);
-
-                (offset_x, corrected_scrolled_y)
+            ItemSize::Dynamic { .. } => {
+                let visible =
+                    get_dynamic_render_range(viewport_size, scroll_position, &item_sizes.read());
+                (visible.range, visible.start_offset)
             }
         };
 
+        let first_visible_index = render_range.start;
+
+        let children = render_range
+            .map(|i| {
+                let item = (self.builder)(i, &self.builder_data);
+
+                match self.item_size {
+                    ItemSize::Fixed(_) => item,
+                    ItemSize::Dynamic { .. } => {
+                        let on_item_sized = move |e: Event<SizedEventData>| {
+                            let measured = match direction {
+                                Direction::Vertical => e.area.height(),
+                                Direction::Horizontal => e.area.width(),
+                            };
+                            if measured <= 0.0 {
+                                return;
+                            }
+
+                            let old_size = match item_sizes.peek().get(i) {
+                                Some(size) => *size,
+                                // The list shrank since this item was scheduled to be measured.
+                                None => return,
+                            };
+                            let delta = measured - old_size;
+                            if delta.abs() < 0.5 {
+                                return;
+                            }
+
+                            item_sizes.with_mut(|mut sizes| sizes[i] = measured);
+                            *item_sizes_total.write() += delta;
+
+                            // Correct the scroll position so already-scrolled-past content
+                            // doesn't visually jump when its real size differs from the cache.
+                            let (live_x, live_y): (i32, i32) = scroll_controller.into();
+                            let scrolled_past_first = match direction {
+                                Direction::Vertical => live_y != 0,
+                                Direction::Horizontal => live_x != 0,
+                            };
+                            let needs_correction = i < first_visible_index
+                                || (i == first_visible_index && scrolled_past_first);
+
+                            if needs_correction {
+                                match direction {
+                                    Direction::Vertical => {
+                                        scroll_controller.scroll_to_y(live_y - delta as i32)
+                                    }
+                                    Direction::Horizontal => {
+                                        scroll_controller.scroll_to_x(live_x - delta as i32)
+                                    }
+                                };
+                                if let Some(task) = *momentum_task.peek() {
+                                    task.cancel();
+                                    momentum_task.set(None);
+                                }
+                            }
+                        };
+
+                        rect()
+                            .key(i)
+                            .width(if direction == Direction::Vertical {
+                                Size::fill()
+                            } else {
+                                Size::Inner
+                            })
+                            .height(if direction == Direction::Vertical {
+                                Size::Inner
+                            } else {
+                                Size::fill()
+                            })
+                            .on_sized(on_item_sized)
+                            .child(item)
+                            .into()
+                    }
+                }
+            })
+            .collect::<Vec<Element>>();
+
+        let (offset_x, offset_y) = match direction {
+            Direction::Vertical => (
+                corrected_scrolled_x,
+                -(-corrected_scrolled_y - start_offset),
+            ),
+            Direction::Horizontal => (
+                -(-corrected_scrolled_x - start_offset),
+                corrected_scrolled_y,
+            ),
+        };
+
         let on_pointer_down = move |e: Event<PointerEventData>| {
-            if drag_scrolling && matches!(e.data(), PointerEventData::Touch(_)) {
-                let task_opt = *momentum_task.peek();
+            if drag_scrolling {
+                let task_opt = *momentum_task.peek(); // extract before if-let to drop ReadRef
                 if let Some(task) = task_opt {
+                    // Cancel in-flight momentum. velocity_tracker is cleared so a short tap
+                    // won't accumulate enough velocity to re-trigger momentum (< MIN_FLING_VELOCITY).
+                    // drag_origin is still set below so a fast swipe in the opposite direction
+                    // can immediately start a new gesture without requiring a second press.
                     task.cancel();
                     momentum_task.set(None);
                     suppress_next_press.set(true);
+                    is_scrolling_state.set(false);
                 }
                 velocity_tracker.write().clear();
                 drag_origin.set(Some(e.global_location()));
@@ -719,4 +857,62 @@ fn get_render_range(
     };
 
     render_index_start as usize..(render_index_end as usize)
+}
+
+/// Range of items that should be rendered for [`ItemSize::Dynamic`], along with the pixel offset
+/// of the start of that range (the prefix sum of all the sizes before it).
+struct VisibleRange {
+    range: Range<usize>,
+    start_offset: f32,
+}
+
+/// Computes [`VisibleRange`] for variable-size items using a prefix sum of `item_sizes` and a
+/// binary search for the first visible item, mirroring [`get_render_range`] but for non-uniform
+/// sizes.
+fn get_dynamic_render_range(
+    viewport_size: f32,
+    scroll_position: f32,
+    item_sizes: &[f32],
+) -> VisibleRange {
+    if item_sizes.is_empty() {
+        return VisibleRange {
+            range: 0..0,
+            start_offset: 0.0,
+        };
+    }
+
+    let scroll_offset = (-scroll_position).max(0.0);
+
+    let mut prefix = Vec::with_capacity(item_sizes.len() + 1);
+    prefix.push(0.0);
+    let mut acc = 0.0;
+    for &size in item_sizes {
+        acc += size;
+        prefix.push(acc);
+    }
+
+    // `prefix[i]` is the offset where item `i` *starts*, so the item containing `scroll_offset`
+    // is the last one whose start is `<= scroll_offset` (i.e. one before the partition point).
+    let start_index = prefix
+        .partition_point(|&start| start <= scroll_offset)
+        .saturating_sub(1)
+        .min(item_sizes.len() - 1);
+    let start_offset = prefix[start_index];
+
+    let visible_end = scroll_offset + viewport_size;
+    let mut end_index = start_index;
+    let mut covered = prefix[start_index];
+    while end_index < item_sizes.len() && covered < visible_end {
+        covered += item_sizes[end_index];
+        end_index += 1;
+    }
+    if end_index < item_sizes.len() {
+        // Render one extra item past the viewport for smooth scrolling, like `get_render_range`.
+        end_index += 1;
+    }
+
+    VisibleRange {
+        range: start_index..end_index,
+        start_offset,
+    }
 }

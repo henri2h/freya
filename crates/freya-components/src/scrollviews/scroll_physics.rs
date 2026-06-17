@@ -1,9 +1,6 @@
-use std::time::{
-    Duration,
-    Instant,
-};
+use std::time::{Duration, Instant};
 
-use freya_core::prelude::*;
+use async_io::Timer;
 use torin::geometry::CursorPoint;
 
 use crate::scrollviews::ScrollController;
@@ -61,7 +58,10 @@ impl VelocityTracker {
         let start = len.saturating_sub(VELOCITY_SAMPLES);
         let (p0, t0) = &self.samples[start];
         let (p1, t1) = &self.samples[len - 1];
-        let dt = t1.checked_duration_since(*t0).map(|d| d.as_secs_f32()).unwrap_or(0.0);
+        let dt = t1
+            .checked_duration_since(*t0)
+            .map(|d| d.as_secs_f32())
+            .unwrap_or(0.0);
         if dt < 0.001 {
             return (0.0, 0.0);
         }
@@ -140,20 +140,38 @@ pub async fn momentum_scroll(
         return;
     }
 
-    let mut ticker = RenderingTicker::get();
     let start_time = Instant::now();
+    let final_x = (start_x + actual_dist_x).round() as i32;
+    let final_y = (start_y + actual_dist_y).round() as i32;
+
+    // Pace the animation by wall-clock time, not by `RenderingTicker`: the ticker
+    // fires whenever a redraw *finishes*, which can be much faster than the
+    // display's refresh rate (and isn't fired at all for a write that doesn't
+    // change the stored scroll value). Tying our loop to it caused the loop to
+    // either spin far faster than 60Hz or stall indefinitely waiting for a tick
+    // that would never come, leaving the final position un-rendered until some
+    // unrelated event (e.g. mouse move) triggered a redraw.
+    const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
     loop {
-        ticker.tick().await;
-        let t = (start_time.elapsed().as_secs_f32() / total_duration).min(1.0);
+        Timer::after(FRAME_INTERVAL).await;
+
+        let progress = (start_time.elapsed().as_secs_f32() / total_duration).min(1.0);
         // Android spline curve approximation: fast at start, decelerates smoothly
-        let curve = 1.0 - (1.0 - t).powf(DECELERATION_RATE);
+        let curve = 1.0 - (1.0 - progress).powf(DECELERATION_RATE);
 
-        scroll_controller.scroll_to_x((start_x + actual_dist_x * curve) as i32);
-        scroll_controller.scroll_to_y((start_y + actual_dist_y * curve) as i32);
+        let pos_x_i = (start_x + actual_dist_x * curve).round() as i32;
+        let pos_y_i = (start_y + actual_dist_y * curve).round() as i32;
 
-        if t >= 1.0 {
+        // Terminate as soon as the pixel position reaches the final target: no
+        // more frozen-tail frames where sub-pixel movement rounds to 0 each tick.
+        if progress >= 1.0 || (pos_x_i == final_x && pos_y_i == final_y) {
+            scroll_controller.scroll_to_x(final_x);
+            scroll_controller.scroll_to_y(final_y);
             break;
         }
+
+        scroll_controller.scroll_to_x(pos_x_i);
+        scroll_controller.scroll_to_y(pos_y_i);
     }
 }

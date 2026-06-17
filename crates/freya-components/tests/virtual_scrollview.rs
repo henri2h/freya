@@ -55,6 +55,241 @@ pub fn virtual_scroll_view_wheel() {
 }
 
 #[test]
+pub fn virtual_scroll_view_dynamic_render_range() {
+    fn virtual_scroll_view_dynamic_app() -> impl IntoElement {
+        VirtualScrollView::new(|i, _| {
+            let height = if i % 3 == 0 { 100. } else { 50. };
+            label()
+                .key(i)
+                .height(Size::px(height))
+                .text(format!("{i} Hello, World!"))
+                .into()
+        })
+        .length(30usize)
+        .item_size(ItemSize::Dynamic { estimate: 50. })
+    }
+
+    let mut test = launch_test(virtual_scroll_view_dynamic_app);
+    // The first pass discovers the real viewport size and measures the items it rendered with
+    // the `estimate` size; the second pass re-renders with the corrected sizes and settles.
+    test.sync_and_update();
+    test.sync_and_update();
+
+    let scrollview = test
+        .find(|node, element| {
+            Rect::try_downcast(element)
+                .filter(|rect| rect.accessibility.builder.role() == AccessibilityRole::ScrollView)
+                .map(move |_| node)
+        })
+        .unwrap();
+    let content = scrollview.children()[0].children()[0].children();
+
+    // Heights alternate 100, 50, 50. Items 0..7 (800px) cover the 500px viewport,
+    // plus one extra item (7) for smooth scrolling = 8 items.
+    assert_eq!(content.len(), 8);
+
+    let expected_heights = [100., 50., 50., 100., 50., 50., 100., 50.];
+    let mut expected_y = 0.;
+    for (n, (i, height)) in (0..8).zip(expected_heights).enumerate() {
+        let item = &content[n];
+        assert_eq!(
+            Label::try_downcast(&*item.children()[0].element())
+                .unwrap()
+                .text,
+            format!("{i} Hello, World!").as_str()
+        );
+        assert_eq!(item.layout().area.height(), height);
+        assert_eq!(item.layout().area.min_y(), expected_y);
+        expected_y += height;
+    }
+
+    // Scroll down by 250px: item 0 (100px) + item 1 (50px) + item 2 (50px) = 200px,
+    // landing 50px into item 3 (100px tall), which becomes the first visible item.
+    test.scroll((5., 5.), (0., -250.));
+
+    let content = scrollview.children()[0].children()[0].children();
+    assert_eq!(content.len(), 9);
+
+    let expected_heights = [100., 50., 50., 100., 50., 50., 100., 50., 50.];
+    let mut expected_y = -50.;
+    for (n, (i, height)) in (3..12).zip(expected_heights).enumerate() {
+        let item = &content[n];
+        assert_eq!(
+            Label::try_downcast(&*item.children()[0].element())
+                .unwrap()
+                .text,
+            format!("{i} Hello, World!").as_str()
+        );
+        assert_eq!(item.layout().area.height(), height);
+        assert_eq!(item.layout().area.min_y(), expected_y);
+        expected_y += height;
+    }
+}
+
+#[test]
+pub fn virtual_scroll_view_dynamic_jump_correction() {
+    fn virtual_scroll_view_dynamic_jump_app() -> impl IntoElement {
+        VirtualScrollView::new(|i, _| {
+            // Item 20 is much taller than the `estimate`, but it is never rendered (and thus
+            // never measured) until we jump straight to the end of the list.
+            let height = if i == 20 { 200. } else { 50. };
+            label()
+                .key(i)
+                .height(Size::px(height))
+                .text(format!("{i} Hello, World!"))
+                .into()
+        })
+        .length(30usize)
+        .item_size(ItemSize::Dynamic { estimate: 50. })
+    }
+
+    let mut test = launch_test(virtual_scroll_view_dynamic_jump_app);
+    test.sync_and_update();
+
+    let scrollview = test
+        .find(|node, element| {
+            Rect::try_downcast(element)
+                .filter(|rect| rect.accessibility.builder.role() == AccessibilityRole::ScrollView)
+                .map(move |_| node)
+        })
+        .unwrap();
+
+    // Focus the scrollview by dragging its scrollbar without actually moving it, mirroring
+    // `virtual_scroll_view_keyboard_navigation`.
+    test.move_cursor((495., 20.));
+    test.sync_and_update();
+    test.press_cursor((495., 20.));
+    test.sync_and_update();
+    test.move_cursor((495., 25.));
+    test.sync_and_update();
+    test.move_cursor((495., 20.));
+    test.sync_and_update();
+    test.release_cursor((495., 20.));
+    test.sync_and_update();
+
+    // Jump straight to the bottom. Item 20 becomes the first visible item, but its cached size
+    // is still the 50px `estimate` (it was never rendered before), while it's actually 200px
+    // tall. The view briefly overflows past the viewport (item 29's bottom ends up at 650px,
+    // 150px beyond the 500px viewport).
+    test.press_key(Key::Named(NamedKey::End));
+
+    let content = scrollview.children()[0].children()[0].children();
+    assert_eq!(content.len(), 10);
+    assert_eq!(
+        Label::try_downcast(&*content[0].children()[0].element())
+            .unwrap()
+            .text,
+        "20 Hello, World!"
+    );
+    assert_eq!(content[0].layout().area.height(), 200.);
+    assert_eq!(content[0].layout().area.min_y(), 0.);
+    let last = &content[9];
+    assert_eq!(
+        Label::try_downcast(&*last.children()[0].element())
+            .unwrap()
+            .text,
+        "29 Hello, World!"
+    );
+    assert_eq!(last.layout().area.min_y() + last.layout().area.height(), 650.);
+
+    // Once item 20 is measured, the scroll position is corrected by the 150px difference so the
+    // list lands back at the true end: item 29's bottom is now exactly at the viewport's bottom.
+    test.sync_and_update();
+
+    let content = scrollview.children()[0].children()[0].children();
+    assert_eq!(content.len(), 10);
+    assert_eq!(
+        Label::try_downcast(&*content[0].children()[0].element())
+            .unwrap()
+            .text,
+        "20 Hello, World!"
+    );
+    assert_eq!(content[0].layout().area.height(), 200.);
+    assert_eq!(content[0].layout().area.min_y(), -150.);
+    let last = &content[9];
+    assert_eq!(
+        Label::try_downcast(&*last.children()[0].element())
+            .unwrap()
+            .text,
+        "29 Hello, World!"
+    );
+    assert_eq!(last.layout().area.min_y() + last.layout().area.height(), 500.);
+}
+
+#[test]
+pub fn virtual_scroll_view_dynamic_horizontal() {
+    fn virtual_scroll_view_dynamic_horizontal_app() -> impl IntoElement {
+        VirtualScrollView::new(|i, _| {
+            let width = if i % 3 == 0 { 100. } else { 50. };
+            label()
+                .key(i)
+                .width(Size::px(width))
+                .text(format!("{i}"))
+                .into()
+        })
+        .length(30usize)
+        .item_size(ItemSize::Dynamic { estimate: 50. })
+        .direction(Direction::Horizontal)
+    }
+
+    let mut test = launch_test(virtual_scroll_view_dynamic_horizontal_app);
+    // See `virtual_scroll_view_dynamic_render_range`: two passes are needed to discover the
+    // viewport size and then settle the cached item sizes.
+    test.sync_and_update();
+    test.sync_and_update();
+
+    let scrollview = test
+        .find(|node, element| {
+            Rect::try_downcast(element)
+                .filter(|rect| rect.accessibility.builder.role() == AccessibilityRole::ScrollView)
+                .map(move |_| node)
+        })
+        .unwrap();
+    let content = scrollview.children()[0].children()[0].children();
+
+    // Widths alternate 100, 50, 50. Items 0..7 (800px) cover the 500px viewport,
+    // plus one extra item (7) for smooth scrolling = 8 items.
+    assert_eq!(content.len(), 8);
+
+    let expected_widths = [100., 50., 50., 100., 50., 50., 100., 50.];
+    let mut expected_x = 0.;
+    for (n, (i, width)) in (0..8).zip(expected_widths).enumerate() {
+        let item = &content[n];
+        assert_eq!(
+            Label::try_downcast(&*item.children()[0].element())
+                .unwrap()
+                .text,
+            format!("{i}").as_str()
+        );
+        assert_eq!(item.layout().area.width(), width);
+        assert_eq!(item.layout().area.min_x(), expected_x);
+        expected_x += width;
+    }
+
+    // Scroll right by 250px: item 0 (100px) + item 1 (50px) + item 2 (50px) = 200px,
+    // landing 50px into item 3 (100px wide), which becomes the first visible item.
+    test.scroll((5., 5.), (-250., 0.));
+
+    let content = scrollview.children()[0].children()[0].children();
+    assert_eq!(content.len(), 9);
+
+    let expected_widths = [100., 50., 50., 100., 50., 50., 100., 50., 50.];
+    let mut expected_x = -50.;
+    for (n, (i, width)) in (3..12).zip(expected_widths).enumerate() {
+        let item = &content[n];
+        assert_eq!(
+            Label::try_downcast(&*item.children()[0].element())
+                .unwrap()
+                .text,
+            format!("{i}").as_str()
+        );
+        assert_eq!(item.layout().area.width(), width);
+        assert_eq!(item.layout().area.min_x(), expected_x);
+        expected_x += width;
+    }
+}
+
+#[test]
 pub fn virtual_scroll_view_scrollbar() {
     fn virtual_scroll_view_scrollbar_app() -> impl IntoElement {
         VirtualScrollView::new(|i, _| {
